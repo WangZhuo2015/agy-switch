@@ -1,0 +1,881 @@
+#!/usr/bin/env bash
+# agy-switch — Multi-Account Switcher & Quota Dashboard for Antigravity CLI
+#
+# Usage:
+#   agy-switch                     Interactive account picker and launcher
+#   agy-switch [agy-flags...]      Launch agy with arguments passed through (e.g. -c)
+#   agy-switch add                 Log in and save a new Google account
+#   agy-switch save [name]         Save currently active session token
+#   agy-switch <email|keyword>     Quick switch to a specific account
+#   agy-switch list                List all saved account profiles
+#   agy-switch current             Show currently active account
+#   agy-switch usage [all]         Check real-time quota
+#   agy-switch delete <keyword>    Delete a saved profile
+
+set -euo pipefail
+
+TOKEN_FILE="$HOME/.gemini/antigravity-cli/antigravity-oauth-token"
+PROFILES_DIR="$HOME/.gemini/antigravity-cli/profiles"
+CURRENT_FILE="$PROFILES_DIR/.current"
+
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+CYAN='\033[0;36m'
+DIM='\033[2m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+mkdir -p "$PROFILES_DIR"
+
+# ── Helpers ──
+
+# Extract email from token file
+get_email() {
+    python3 -c "
+import json, base64, sys
+try:
+    with open('$1') as f:
+        data = json.load(f)
+    id_token = data.get('id_token', '')
+    if id_token:
+        payload = id_token.split('.')[1]
+        payload += '=' * (4 - len(payload) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(payload))
+        print(decoded.get('email', ''))
+    else:
+        print('')
+except:
+    print('')
+" 2>/dev/null
+}
+
+# Extract access_token from token file
+get_access_token() {
+    python3 -c "
+import json
+with open('$1') as f:
+    data = json.load(f)
+print(data.get('token', {}).get('access_token', ''))
+" 2>/dev/null
+}
+
+# Extract expiry from token file
+get_expiry() {
+    python3 -c "
+import json
+with open('$1') as f:
+    data = json.load(f)
+print(data.get('token', {}).get('expiry', 'unknown'))
+" 2>/dev/null
+}
+
+# Email -> Safe filename (@ replaced with _at_)
+email_to_filename() {
+    echo "$1" | sed 's/@/_at_/g'
+}
+
+# Safe filename -> Email
+filename_to_email() {
+    echo "$1" | sed 's/_at_/@/g'
+}
+
+# Match profile by exact email, file name, or partial keyword
+find_profile() {
+    local query="$1"
+    local matches=()
+
+    shopt -s nullglob
+    local all_profiles=("$PROFILES_DIR"/*.json)
+    shopt -u nullglob
+
+    if [[ ${#all_profiles[@]} -eq 0 ]]; then
+        echo -e "${RED}✗ No saved accounts found${NC}" >&2
+        return 1
+    fi
+
+    for f in "${all_profiles[@]}"; do
+        local name
+        name=$(basename "$f" .json)
+        local email
+        email=$(filename_to_email "$name")
+
+        if [[ "$email" == "$query" || "$name" == "$query" ]]; then
+            echo "$f"
+            return 0
+        fi
+    done
+
+    for f in "${all_profiles[@]}"; do
+        local name
+        name=$(basename "$f" .json)
+        local email
+        email=$(filename_to_email "$name")
+
+        if [[ "$email" == *"$query"* || "$name" == *"$query"* ]]; then
+            matches+=("$f")
+        fi
+    done
+
+    if [[ ${#matches[@]} -eq 1 ]]; then
+        echo "${matches[0]}"
+        return 0
+    elif [[ ${#matches[@]} -gt 1 ]]; then
+        echo -e "${RED}✗ Multiple matching accounts found:${NC}" >&2
+        for f in "${matches[@]}"; do
+            local name
+            name=$(basename "$f" .json)
+            echo -e "    $(filename_to_email "$name")" >&2
+        done
+        echo -e "${YELLOW}Please specify a more specific keyword.${NC}" >&2
+        return 1
+    else
+        echo -e "${RED}✗ No account matching '$query' found${NC}" >&2
+        cmd_list >&2
+        return 1
+    fi
+}
+
+# ── Core Commands ──
+
+cmd_save() {
+    local alias_name="${1:-}"
+    if [[ ! -f "$TOKEN_FILE" ]]; then
+        echo -e "${RED}✗ Token file not found. Please log in with agy first.${NC}"
+        exit 1
+    fi
+
+    local email
+    email=$(get_email "$TOKEN_FILE")
+
+    if [[ -z "$email" ]]; then
+        echo -e "${RED}✗ Unable to parse email from token file.${NC}"
+        exit 1
+    fi
+
+    local filename
+    if [[ -n "$alias_name" ]]; then
+        filename="$alias_name"
+    else
+        filename=$(email_to_filename "$email")
+    fi
+
+    cp "$TOKEN_FILE" "$PROFILES_DIR/$filename.json"
+    echo "$filename" > "$CURRENT_FILE"
+    echo -e "${GREEN}✓ Saved account: ${CYAN}$email${NC}"
+}
+
+cmd_switch() {
+    local query="$1"
+    local profile
+    profile=$(find_profile "$query") || exit 1
+
+    cp "$profile" "$TOKEN_FILE"
+    local name
+    name=$(basename "$profile" .json)
+    echo "$name" > "$CURRENT_FILE"
+    local email
+    email=$(filename_to_email "$name")
+    echo -e "${GREEN}✓ Switched to: ${CYAN}$email${NC}"
+    echo -e "${YELLOW}Note: If agy is currently running, restart it to apply the new account.${NC}"
+}
+
+cmd_list() {
+    shopt -s nullglob
+    local all_profiles=("$PROFILES_DIR"/*.json)
+    shopt -u nullglob
+
+    if [[ ${#all_profiles[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}No accounts saved yet.${NC}"
+        echo -e "Use ${CYAN}agy-switch save${NC} or ${CYAN}agy-switch add${NC} to add an account."
+        return
+    fi
+
+    local current=""
+    [[ -f "$CURRENT_FILE" ]] && current=$(cat "$CURRENT_FILE")
+
+    echo -e "${BOLD}Saved accounts:${NC}"
+    echo ""
+    for f in "${all_profiles[@]}"; do
+        local name
+        name=$(basename "$f" .json)
+        local email
+        email=$(filename_to_email "$name")
+        if [[ "$name" == "$current" ]]; then
+            echo -e "  ${GREEN}▶ $email${NC}  ${GREEN}← active${NC}"
+        else
+            echo -e "    $email"
+        fi
+    done
+    echo ""
+}
+
+cmd_current() {
+    if [[ -f "$CURRENT_FILE" ]]; then
+        local current
+        current=$(cat "$CURRENT_FILE")
+        local email
+        email=$(filename_to_email "$current")
+        echo -e "${GREEN}Active account: ${CYAN}$email${NC}"
+    else
+        echo -e "${YELLOW}No active account recorded.${NC}"
+    fi
+}
+
+cmd_usage() {
+    local check_all=false
+    for arg in "$@"; do
+        [[ "$arg" == "all" || "$arg" == "-a" ]] && check_all=true
+    done
+
+    if $check_all; then
+        shopt -s nullglob
+        local all_profiles=("$PROFILES_DIR"/*.json)
+        shopt -u nullglob
+
+        if [[ ${#all_profiles[@]} -eq 0 ]]; then
+            echo -e "${YELLOW}No accounts saved yet.${NC}"
+            return
+        fi
+
+        local current=""
+        [[ -f "$CURRENT_FILE" ]] && current=$(cat "$CURRENT_FILE")
+
+        echo -e "${DIM}Querying quotas concurrently across all accounts...${NC}"
+
+        local work_dir
+        work_dir=$(mktemp -d)
+
+        local pids=()
+        local idx=0
+        local profile_emails=()
+        local profile_markers=()
+
+        for f in "${all_profiles[@]}"; do
+            local name
+            name=$(basename "$f" .json)
+            local email
+            email=$(filename_to_email "$name")
+            local marker=""
+            [[ "$name" == "$current" ]] && marker="  ${GREEN}← active${NC}"
+
+            profile_emails+=("$email")
+            profile_markers+=("$marker")
+
+            _parallel_query_worker "$f" "$work_dir/$idx.out" &
+            pids+=($!)
+            idx=$((idx + 1))
+        done
+
+        for pid in "${pids[@]}"; do
+            wait "$pid" 2>/dev/null || true
+        done
+
+        for i in "${!profile_emails[@]}"; do
+            local email="${profile_emails[$i]}"
+            local marker="${profile_markers[$i]}"
+            local raw=""
+            [[ -f "$work_dir/$i.out" ]] && raw=$(cat "$work_dir/$i.out")
+            echo ""
+            _render_raw_quota "$email" "$marker" "$raw"
+        done
+
+        rm -rf "$work_dir"
+        echo ""
+    else
+        if [[ ! -f "$TOKEN_FILE" ]]; then
+            echo -e "${RED}✗ Not logged in${NC}"
+            exit 1
+        fi
+        local email
+        email=$(get_email "$TOKEN_FILE")
+        local raw
+        raw=$(_query_usage_isolated "$TOKEN_FILE")
+        _render_raw_quota "$email" "" "$raw"
+    fi
+}
+
+_parallel_query_worker() {
+    local token_file="$1"
+    local outfile="$2"
+    _query_usage_isolated "$token_file" > "$outfile" 2>/dev/null
+}
+
+_query_usage_isolated() {
+    local token_src="$1"
+    local tmp_home
+    tmp_home=$(mktemp -d)
+
+    mkdir -p "$tmp_home/.gemini/antigravity-cli"
+    cp "$HOME/.gemini/antigravity-cli/settings.json" "$tmp_home/.gemini/antigravity-cli/" 2>/dev/null || true
+    cp "$token_src" "$tmp_home/.gemini/antigravity-cli/antigravity-oauth-token" 2>/dev/null || true
+
+    local tmpout
+    tmpout=$(mktemp)
+
+    HOME="$tmp_home" timeout 15 script -qec "agy -p '/usage' --print-timeout 20s" /dev/null \
+        </dev/null >"$tmpout" 2>/dev/null || true
+
+    local output
+    output=$(cat "$tmpout" 2>/dev/null)
+    rm -rf "$tmp_home" "$tmpout"
+
+    if [[ -n "$output" ]]; then
+        echo "$output" | grep -v "^Quota:" | grep -v "^Script " | grep -v "^$"
+    fi
+}
+
+_render_raw_quota() {
+    local email="$1"
+    local marker="$2"
+    local raw="$3"
+
+    if [[ -z "$raw" ]]; then
+        echo -e "  ${CYAN}${BOLD}$email${NC}${marker}"
+        echo -e "    ${RED}✗ Query failed (token may need refreshing)${NC}"
+        return
+    fi
+
+    echo "$raw" | python3 -c "
+import sys
+
+G = '\033[0;32m'
+Y = '\033[1;33m'
+R = '\033[0;31m'
+C = '\033[0;36m'
+B = '\033[1m'
+D = '\033[2m'
+NC = '\033[0m'
+
+email = '''$email'''
+marker = '''$marker'''
+
+print(f'  {C}{B}{email}{NC}{marker}')
+
+lines = [l.strip() for l in sys.stdin if l.strip()]
+
+groups = {}
+for line in lines:
+    parts = line.split('\t')
+    if len(parts) < 3:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+    pct_str = None
+    model = None
+    period = None
+    for i, p in enumerate(parts):
+        if p.endswith('%'):
+            try:
+                pct_str = int(p.replace('%', ''))
+                full = ' '.join(parts[:i])
+                if 'Weekly' in full or 'weekly' in full:
+                    period = 'Weekly'
+                    model = full.split('Weekly')[0].strip().split('week')[0].strip()
+                elif 'Five' in full or 'Hour' in full or 'five' in full:
+                    period = '5-Hour'
+                    model = full.split('Five')[0].strip().split('five')[0].strip()
+                else:
+                    period = 'Quota'
+                    model = full.strip()
+                break
+            except:
+                continue
+
+    if pct_str is not None and model and period:
+        model = model.replace('Limit Remaining', '').replace('Limit', '').strip()
+        if model not in groups:
+            groups[model] = {}
+        groups[model][period] = pct_str
+
+for model, periods in groups.items():
+    short = model
+    if 'Claude' in model or 'GPT' in model:
+        short = 'Claude/GPT'
+    elif 'Gemini' in model:
+        short = 'Gemini Pro'
+
+    parts_out = []
+    for period in ['5-Hour', 'Weekly']:
+        if period not in periods:
+            continue
+        pct = periods[period]
+
+        filled = pct * 16 // 100
+        empty = 16 - filled
+
+        if pct >= 60:
+            color = G
+        elif pct >= 30:
+            color = Y
+        else:
+            color = R
+
+        bar = f'{color}[\"#' * filled + '-' * empty + f']{NC}'
+        pct_display = f'{pct:>3}%'
+        parts_out.append(f'{period}: {bar} {color}{pct_display}{NC}')
+
+    label = f'{short:<12}'
+    print(f'    {label}  {\"   \".join(parts_out)}')
+" 2>/dev/null
+}
+
+cmd_delete() {
+    local query="$1"
+    local profile
+    profile=$(find_profile "$query") || exit 1
+    local name
+    name=$(basename "$profile" .json)
+    local email
+    email=$(filename_to_email "$name")
+    rm "$profile"
+    echo -e "${GREEN}✓ Deleted profile: $email${NC}"
+    if [[ -f "$CURRENT_FILE" ]] && [[ "$(cat "$CURRENT_FILE")" == "$name" ]]; then
+        rm "$CURRENT_FILE"
+    fi
+}
+
+cmd_add() {
+    echo -e "${CYAN}${BOLD}=== Add New Google Account ===${NC}"
+    echo -e "${DIM}Temporarily moving active session token to trigger OAuth login flow...${NC}"
+
+    local backup=""
+    if [[ -f "$TOKEN_FILE" ]]; then
+        backup=$(mktemp)
+        cp "$TOKEN_FILE" "$backup"
+        rm -f "$TOKEN_FILE"
+    fi
+
+    echo -e "${YELLOW}Please complete Google login in the browser window/prompt that opens.${NC}"
+    echo -e "${DIM}After logging in, exit agy and this tool will save your new account. Press Enter to continue...${NC}"
+    read -r
+
+    agy "$@" || true
+
+    if [[ -f "$TOKEN_FILE" ]]; then
+        local new_email
+        new_email=$(get_email "$TOKEN_FILE")
+        if [[ -n "$new_email" ]]; then
+            local fname
+            fname=$(email_to_filename "$new_email")
+            cp "$TOKEN_FILE" "$PROFILES_DIR/$fname.json"
+            echo "$fname" > "$CURRENT_FILE"
+            echo -e "${GREEN}✓ Successfully saved new account: ${CYAN}${BOLD}$new_email${NC}"
+            [[ -n "$backup" ]] && rm -f "$backup"
+            return 0
+        fi
+    fi
+
+    echo -e "${YELLOW}No new login token detected. Restoring previous account...${NC}"
+    if [[ -n "$backup" && -f "$backup" ]]; then
+        cp "$backup" "$TOKEN_FILE"
+        rm -f "$backup"
+    fi
+}
+
+cmd_interactive() {
+    local passthrough_args=("$@")
+    shopt -s nullglob
+    local all_profiles=("$PROFILES_DIR"/*.json)
+    shopt -u nullglob
+
+    if [[ ${#all_profiles[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}No saved accounts found. Initiating login...${NC}"
+        cmd_add "${passthrough_args[@]}"
+        return
+    fi
+
+    local current=""
+    [[ -f "$CURRENT_FILE" ]] && current=$(cat "$CURRENT_FILE")
+
+    echo -e "${DIM}Fetching latest quota from all accounts in parallel...${NC}"
+
+    local work_dir
+    work_dir=$(mktemp -d)
+
+    local pids=()
+    local idx=0
+    local profile_files=()
+    local profile_emails=()
+    local profile_is_current=()
+
+    for f in "${all_profiles[@]}"; do
+        local name
+        name=$(basename "$f" .json)
+        local email
+        email=$(filename_to_email "$name")
+        local is_curr="0"
+        [[ "$name" == "$current" ]] && is_curr="1"
+
+        profile_files+=("$f")
+        profile_emails+=("$email")
+        profile_is_current+=("$is_curr")
+
+        _parallel_query_worker "$f" "$work_dir/$idx.out" &
+        pids+=($!)
+        idx=$((idx + 1))
+    done
+
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    local json_data
+    json_data=$(python3 - "$work_dir" "${#profile_emails[@]}" << 'PYEOF'
+import sys, json, os
+
+work_dir = sys.argv[1]
+count = int(sys.argv[2])
+results = []
+
+for i in range(count):
+    outfile = os.path.join(work_dir, f"{i}.out")
+    raw = ""
+    if os.path.exists(outfile):
+        with open(outfile, "r", encoding="utf-8", errors="ignore") as f:
+            raw = f.read()
+    results.append(raw)
+
+print(json.dumps(results))
+PYEOF
+)
+    rm -rf "$work_dir"
+
+    local choice_file
+    choice_file=$(mktemp)
+    local py_script
+    py_script=$(mktemp)
+
+    cat << 'PYEOF' > "$py_script"
+import curses
+import sys
+import json
+import os
+import locale
+from datetime import datetime, timezone
+
+try:
+    locale.setlocale(locale.LC_ALL, '')
+except:
+    pass
+
+choice_file = sys.argv[1]
+json_data = json.loads(sys.argv[2])
+emails = sys.argv[3:]
+count = len(emails)
+
+def calc_time_left(iso_str):
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        secs = int((dt - now).total_seconds())
+        if secs <= 0:
+            return "ready"
+        days = secs // 86400
+        hrs = (secs % 86400) // 3600
+        mins = (secs % 3600) // 60
+        if days > 0:
+            return f"{days}d {hrs:02d}h"
+        elif hrs > 0:
+            return f"{hrs}h {mins:02d}m"
+        else:
+            return f"{mins}m"
+    except:
+        return ""
+
+def parse_quota(raw):
+    lines = [l.strip() for l in raw.split("\n") if l.strip()]
+    models = {
+        "Gemini": {"5h": None, "Week": None},
+        "Claude": {"5h": None, "Week": None}
+    }
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) < 3:
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+
+        pct = None
+        period = None
+        reset_time = ""
+        full_text = " ".join(parts)
+
+        m_key = "Gemini" if "Gemini" in full_text else ("Claude" if ("Claude" in full_text or "GPT" in full_text) else None)
+        if not m_key:
+            continue
+
+        if "Weekly" in full_text or "weekly" in full_text:
+            period = "Week"
+        elif "Five" in full_text or "Hour" in full_text or "five" in full_text:
+            period = "5h"
+
+        for p in parts:
+            if p.endswith("%"):
+                try:
+                    pct = int(p.replace("%", ""))
+                except:
+                    pass
+            elif "T" in p and (p.endswith("Z") or "+" in p):
+                reset_time = p
+
+        if pct is not None and period:
+            models[m_key][period] = {
+                "pct": pct,
+                "reset": calc_time_left(reset_time) if reset_time else ""
+            }
+    return models
+
+cards = []
+for i in range(count):
+    e = emails[i]
+    q_data = parse_quota(json_data[i])
+    cards.append({"type": "account", "email": e, "quota": q_data})
+
+cards.append({"type": "add", "email": "+ Add New Google Account", "quota": None})
+
+def render_bar(pct, width=10):
+    filled = max(0, min(width, int(pct * width / 100)))
+    empty = width - filled
+    return "#" * filled + "-" * empty
+
+def main(stdscr):
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    stdscr.nodelay(False)
+
+    curses.start_color()
+    curses.use_default_colors()
+
+    curses.init_pair(1, curses.COLOR_CYAN, -1)     # Selection header/border
+    curses.init_pair(2, curses.COLOR_GREEN, -1)    # Healthy (>=60%)
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)   # Warning (30-59%)
+    curses.init_pair(4, curses.COLOR_RED, -1)      # Low (<30%)
+    curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_CYAN)   # Selected tag
+    curses.init_pair(6, curses.COLOR_WHITE, -1)    # Regular text
+    curses.init_pair(7, 8 if curses.COLORS > 8 else curses.COLOR_WHITE, -1) # Border dim
+
+    selected = 0
+
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+
+        title = " === ANTIGRAVITY MULTI-ACCOUNT MANAGER ==="
+        tips = " [UP/DOWN] Move   [Enter] Launch   [1-9] Quick pick   [a] Add Account   [q] Quit"
+        try:
+            stdscr.addstr(1, 2, title, curses.color_pair(1) | curses.A_BOLD)
+            stdscr.addstr(1, len(title) + 3, tips, curses.color_pair(6))
+        except:
+            pass
+
+        row = 3
+        card_w = min(w - 4, 82)
+
+        for idx, card in enumerate(cards):
+            is_sel = (idx == selected)
+            c_type = card["type"]
+
+            border_c = curses.color_pair(1) | curses.A_BOLD if is_sel else curses.color_pair(7)
+
+            if c_type == "add":
+                tag = " [+] Add New Google Account "
+                try:
+                    stdscr.addstr(row, 2, "+-" + ("-" * (card_w - 2)) + "+", border_c)
+                    row += 1
+                    stdscr.addstr(row, 2, "|", border_c)
+                    stdscr.addstr(row, card_w + 1, "|", border_c)
+                    if is_sel:
+                        stdscr.addstr(row, 4, "▶", curses.color_pair(2) | curses.A_BOLD)
+                        stdscr.addstr(row, 6, tag, curses.color_pair(5) | curses.A_BOLD)
+                        stdscr.addstr(row, 6 + len(tag) + 1, "(Press Enter or 'a' to log in)", curses.color_pair(2))
+                    else:
+                        stdscr.addstr(row, 6, tag, curses.color_pair(2) | curses.A_BOLD)
+                        stdscr.addstr(row, 6 + len(tag) + 1, "(Press Enter or 'a' to log in)", curses.color_pair(7))
+                    row += 1
+                    stdscr.addstr(row, 2, "+-" + ("-" * (card_w - 2)) + "+", border_c)
+                except:
+                    pass
+                row += 2
+                continue
+
+            email = card["email"]
+            q_info = card["quota"]
+
+            num_tag = f" [{idx+1}] {email} "
+            try:
+                line_top = "+--" + num_tag + "-" * max(0, card_w - len(num_tag) - 3) + "+"
+                if is_sel:
+                    stdscr.addstr(row, 2, "+--", border_c)
+                    stdscr.addstr(row, 5, num_tag, curses.color_pair(5) | curses.A_BOLD)
+                    stdscr.addstr(row, 5 + len(num_tag), "-" * max(0, card_w - len(num_tag) - 3) + "+", border_c)
+                else:
+                    stdscr.addstr(row, 2, line_top[:card_w+1], border_c)
+            except:
+                pass
+            row += 1
+
+            for m_name in ["Gemini", "Claude"]:
+                m_data = q_info.get(m_name, {})
+                try:
+                    stdscr.addstr(row, 2, "|", border_c)
+                    stdscr.addstr(row, card_w + 1, "|", border_c)
+
+                    m_label = "Gemini Pro" if m_name == "Gemini" else "Claude/GPT"
+                    stdscr.addstr(row, 5, f"{m_label:<11}", curses.color_pair(1 if is_sel else 6) | curses.A_BOLD)
+
+                    # 5h quota
+                    i5 = m_data.get("5h")
+                    if i5 and i5.get("pct") is not None:
+                        pct = i5["pct"]
+                        bar = render_bar(pct, 10)
+                        c = curses.color_pair(2) if pct >= 60 else (curses.color_pair(3) if pct >= 30 else curses.color_pair(4))
+                        rst = f"({i5['reset']})" if i5.get("reset") else ""
+
+                        stdscr.addstr(row, 18, "5h:[", curses.color_pair(6))
+                        stdscr.addstr(row, 22, bar, c | curses.A_BOLD)
+                        stdscr.addstr(row, 32, f"] {pct:>3}%", c | curses.A_BOLD)
+                        stdscr.addstr(row, 39, f"{rst:<9}", curses.color_pair(7))
+                    else:
+                        stdscr.addstr(row, 18, "5h: --", curses.color_pair(7))
+
+                    # Weekly quota
+                    iw = m_data.get("Week")
+                    if iw and iw.get("pct") is not None:
+                        pct = iw["pct"]
+                        bar = render_bar(pct, 10)
+                        c = curses.color_pair(2) if pct >= 60 else (curses.color_pair(3) if pct >= 30 else curses.color_pair(4))
+                        rst = f"({iw['reset']})" if iw.get("reset") else ""
+
+                        stdscr.addstr(row, 50, "Wk:[", curses.color_pair(6))
+                        stdscr.addstr(row, 54, bar, c | curses.A_BOLD)
+                        stdscr.addstr(row, 64, f"] {pct:>3}%", c | curses.A_BOLD)
+                        stdscr.addstr(row, 71, f"{rst:<9}", curses.color_pair(7))
+                    else:
+                        stdscr.addstr(row, 50, "Wk: --", curses.color_pair(7))
+                except:
+                    pass
+                row += 1
+
+            try:
+                stdscr.addstr(row, 2, "+-" + ("-" * (card_w - 2)) + "+", border_c)
+            except:
+                pass
+            row += 2
+
+        stdscr.refresh()
+        key = stdscr.getch()
+
+        if key in [ord("q"), ord("Q"), 27]:
+            return
+        elif key in [ord("a"), ord("A")]:
+            with open(choice_file, "w") as out_f:
+                out_f.write("__ADD_NEW__")
+            return
+        elif key in [curses.KEY_UP, ord("k"), ord("K")]:
+            selected = (selected - 1) % len(cards)
+        elif key in [curses.KEY_DOWN, ord("j"), ord("J")]:
+            selected = (selected + 1) % len(cards)
+        elif key in [curses.KEY_ENTER, 10, 13]:
+            sel_card = cards[selected]
+            if sel_card["type"] == "add":
+                with open(choice_file, "w") as out_f:
+                    out_f.write("__ADD_NEW__")
+            else:
+                with open(choice_file, "w") as out_f:
+                    out_f.write(sel_card["email"])
+            return
+        elif ord("1") <= key <= ord("9"):
+            num = key - ord("1")
+            if num < len(cards):
+                sel_card = cards[num]
+                if sel_card["type"] == "add":
+                    with open(choice_file, "w") as out_f:
+                        out_f.write("__ADD_NEW__")
+                else:
+                    with open(choice_file, "w") as out_f:
+                        out_f.write(sel_card["email"])
+                return
+
+curses.wrapper(main)
+PYEOF
+
+    python3 "$py_script" "$choice_file" "$json_data" "${profile_emails[@]}"
+    rm -f "$py_script"
+
+    local selected_action=""
+    if [[ -f "$choice_file" ]]; then
+        selected_action=$(cat "$choice_file")
+        rm -f "$choice_file"
+    fi
+
+    if [[ "$selected_action" == "__ADD_NEW__" ]]; then
+        cmd_add "${passthrough_args[@]}"
+        return
+    elif [[ -n "$selected_action" ]]; then
+        echo -e "${GREEN}✓ Switching to account: ${CYAN}${BOLD}$selected_action${NC}"
+        cmd_switch "$selected_action" >/dev/null
+        if [[ ${#passthrough_args[@]} -gt 0 ]]; then
+            echo -e "${DIM}Launching agy with args: ${passthrough_args[*]}${NC}"
+        else
+            echo -e "${DIM}Launching agy...${NC}"
+        fi
+        exec agy "${passthrough_args[@]}"
+    fi
+}
+
+cmd_help() {
+    echo -e "${BOLD}agy-switch${NC} — Antigravity CLI Multi-Account Switcher & Quota Dashboard"
+    echo ""
+    echo -e "Usage:"
+    echo -e "  ${CYAN}agy-switch [agy-flags...]${NC}        Interactive TUI picker & pass-through args to agy"
+    echo -e "  ${CYAN}agy-switch add${NC}                   Log in and register a new Google account"
+    echo -e "  ${CYAN}agy-switch save${NC}                  Save the current active session account"
+    echo -e "  ${CYAN}agy-switch <email|keyword>${NC}       Fast switch by email or keyword"
+    echo -e "  ${CYAN}agy-switch list${NC}                  List all saved accounts"
+    echo -e "  ${CYAN}agy-switch current${NC}               Show current active account"
+    echo -e "  ${CYAN}agy-switch usage${NC}                 Show current account quota"
+    echo -e "  ${CYAN}agy-switch usage all${NC}             Concurrently check quota across all accounts"
+    echo -e "  ${CYAN}agy-switch delete <keyword>${NC}      Delete a saved account"
+    echo ""
+    echo -e "${YELLOW}Examples:${NC}"
+    echo -e "  agy-switch -c                                 # Pick account & resume previous chat"
+    echo -e "  agy-switch --dangerously-skip-permissions     # Pick account & auto-approve permissions"
+    echo -e "  agy-switch -c --dangerously-skip-permissions  # Seamless multi-flag pass-through"
+    echo -e "  agy-switch add                                # Guided OAuth login for new account"
+}
+
+# ── Main Entrypoint ──
+case "${1:-}" in
+    add|new)
+        shift
+        cmd_add "$@"
+        ;;
+    save)
+        cmd_save "${2:-}"
+        ;;
+    list|ls)
+        cmd_list
+        ;;
+    current|whoami)
+        cmd_current
+        ;;
+    usage|quota)
+        shift
+        cmd_usage "$@"
+        ;;
+    delete|rm)
+        [[ -z "${2:-}" ]] && echo -e "${RED}Please specify an account to delete${NC}" && exit 1
+        cmd_delete "$2"
+        ;;
+    help|--help|-h)
+        cmd_help
+        ;;
+    *)
+        if [[ -n "${1:-}" && -f "$PROFILES_DIR/$(email_to_filename "$1").json" ]]; then
+            cmd_switch "$1"
+        else
+            cmd_interactive "$@"
+        fi
+        ;;
+esac
