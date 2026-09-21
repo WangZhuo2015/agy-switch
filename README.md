@@ -90,6 +90,12 @@ agy-switch add
 # Save the currently active token as a profile
 agy-switch save
 
+# Export all account profiles to a portable archive
+agy-switch export [my-accounts.tar.gz]
+
+# Import account profiles on a new machine
+agy-switch import my-accounts.tar.gz
+
 # Delete a saved profile
 agy-switch delete <keyword>
 ```

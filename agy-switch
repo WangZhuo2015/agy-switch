@@ -435,6 +435,62 @@ cmd_delete() {
     fi
 }
 
+cmd_export() {
+    local target="${1:-}"
+    shopt -s nullglob
+    local all_profiles=("$PROFILES_DIR"/*.json)
+    shopt -u nullglob
+
+    if [[ ${#all_profiles[@]} -eq 0 ]]; then
+        echo -e "${RED}✗ No saved accounts found to export.${NC}"
+        return 1
+    fi
+
+    # If target is not given, generate a default filename with timestamp
+    if [[ -z "$target" ]]; then
+        target="agy-profiles-$(date +%Y%m%d-%H%M%S).tar.gz"
+    fi
+
+    echo -e "${DIM}Exporting ${#all_profiles[@]} account profile(s)...${NC}"
+    tar -czf "$target" -C "$HOME/.gemini/antigravity-cli" profiles
+
+    echo -e "${GREEN}✓ Exported successfully to: ${CYAN}${BOLD}$target${NC}"
+    echo -e "${DIM}You can copy this file to another machine and run: ${CYAN}agy-switch import $target${NC}"
+}
+
+cmd_import() {
+    local file="${1:-}"
+    if [[ -z "$file" || ! -f "$file" ]]; then
+        echo -e "${RED}✗ Please specify an export archive to import (e.g. agy-switch import profiles.tar.gz)${NC}"
+        return 1
+    fi
+
+    echo -e "${DIM}Importing account profiles from $file...${NC}"
+    mkdir -p "$HOME/.gemini/antigravity-cli"
+    tar -xzf "$file" -C "$HOME/.gemini/antigravity-cli"
+
+    shopt -s nullglob
+    local all_profiles=("$PROFILES_DIR"/*.json)
+    shopt -u nullglob
+
+    echo -e "${GREEN}✓ Import complete! Found ${#all_profiles[@]} account profile(s):${NC}"
+    for f in "${all_profiles[@]}"; do
+        local name
+        name=$(basename "$f" .json)
+        echo -e "  - ${CYAN}$(filename_to_email "$name")${NC}"
+    done
+
+    # If no active token exists, activate the first profile
+    if [[ ! -f "$TOKEN_FILE" && ${#all_profiles[@]} -gt 0 ]]; then
+        local first="${all_profiles[0]}"
+        cp "$first" "$TOKEN_FILE"
+        local fname
+        fname=$(basename "$first" .json)
+        echo "$fname" > "$CURRENT_FILE"
+        echo -e "${GREEN}✓ Activated default account: ${CYAN}$(filename_to_email "$fname")${NC}"
+    fi
+}
+
 cmd_add() {
     echo -e "${CYAN}${BOLD}=== Add New Google Account ===${NC}"
     echo -e "${DIM}Temporarily moving active session token to trigger OAuth login flow...${NC}"
@@ -830,6 +886,8 @@ cmd_help() {
     echo -e "Usage:"
     echo -e "  ${CYAN}agy-switch [agy-flags...]${NC}        Interactive TUI picker & pass-through args to agy"
     echo -e "  ${CYAN}agy-switch add${NC}                   Log in and register a new Google account"
+    echo -e "  ${CYAN}agy-switch export [file]${NC}         Export all account profiles to a portable archive"
+    echo -e "  ${CYAN}agy-switch import <file>${NC}         Import accounts from an exported archive"
     echo -e "  ${CYAN}agy-switch save${NC}                  Save the current active session account"
     echo -e "  ${CYAN}agy-switch <email|keyword>${NC}       Fast switch by email or keyword"
     echo -e "  ${CYAN}agy-switch list${NC}                  List all saved accounts"
@@ -839,9 +897,10 @@ cmd_help() {
     echo -e "  ${CYAN}agy-switch delete <keyword>${NC}      Delete a saved account"
     echo ""
     echo -e "${YELLOW}Examples:${NC}"
+    echo -e "  agy-switch export my-accounts.tar.gz          # Export profiles for another machine"
+    echo -e "  agy-switch import my-accounts.tar.gz          # Import on the new machine"
     echo -e "  agy-switch -c                                 # Pick account & resume previous chat"
     echo -e "  agy-switch --dangerously-skip-permissions     # Pick account & auto-approve permissions"
-    echo -e "  agy-switch -c --dangerously-skip-permissions  # Seamless multi-flag pass-through"
     echo -e "  agy-switch add                                # Guided OAuth login for new account"
 }
 
@@ -850,6 +909,14 @@ case "${1:-}" in
     add|new)
         shift
         cmd_add "$@"
+        ;;
+    export)
+        shift
+        cmd_export "${1:-}"
+        ;;
+    import)
+        shift
+        cmd_import "${1:-}"
         ;;
     save)
         cmd_save "${2:-}"
