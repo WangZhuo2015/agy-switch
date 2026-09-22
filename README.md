@@ -104,7 +104,9 @@ agy-switch delete <keyword>
 
 ## 🛠️ How It Works
 
-Antigravity CLI stores OAuth credentials under `~/.gemini/antigravity-cli/antigravity-oauth-token`. `agy-switch` manages token profiles under `~/.gemini/antigravity-cli/profiles/`, and queries official `/usage` slash command responses concurrently in temporary isolated environments to avoid blocking or interfering with active terminal sessions.
+Antigravity CLI stores OAuth credentials under `~/.gemini/antigravity-cli/antigravity-oauth-token`, and Antigravity Desktop stores them under `~/.gemini/jetski-standalone-oauth-token`.
+
+`agy-switch` automatically discovers and synchronizes tokens from both CLI and Desktop into unified profiles under `~/.gemini/antigravity-cli/profiles/` with zero manual configuration. Whenever you switch accounts or log into a new account, the active credentials are synchronized across both CLI and Desktop simultaneously. Quota inspections query official `/usage` slash command responses concurrently in temporary isolated environments to avoid blocking or interfering with active terminal sessions.
 
 ---
 

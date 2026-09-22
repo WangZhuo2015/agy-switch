@@ -15,6 +15,8 @@
 set -euo pipefail
 
 TOKEN_FILE="$HOME/.gemini/antigravity-cli/antigravity-oauth-token"
+CLI_TOKEN_FILE="$TOKEN_FILE"
+DESKTOP_TOKEN_FILE="$HOME/.gemini/jetski-standalone-oauth-token"
 PROFILES_DIR="$HOME/.gemini/antigravity-cli/profiles"
 CURRENT_FILE="$PROFILES_DIR/.current"
 
@@ -80,6 +82,65 @@ filename_to_email() {
     echo "$1" | sed 's/_at_/@/g'
 }
 
+# ── Token Auto-Sync (CLI & Desktop unified) ──
+auto_sync_tokens() {
+    python3 -c "
+import os, json, base64, shutil
+
+profiles_dir = os.path.expanduser('~/.gemini/antigravity-cli/profiles')
+os.makedirs(profiles_dir, exist_ok=True)
+
+sources = [
+    os.path.expanduser('~/.gemini/antigravity-cli/antigravity-oauth-token'),
+    os.path.expanduser('~/.gemini/jetski-standalone-oauth-token')
+]
+
+for src_path in sources:
+    if not os.path.exists(src_path):
+        continue
+    try:
+        with open(src_path) as f:
+            data = json.load(f)
+        id_token = data.get('id_token', '')
+        if not id_token:
+            continue
+        payload = id_token.split('.')[1]
+        payload += '=' * (4 - len(payload) % 4)
+        email = json.loads(base64.urlsafe_b64decode(payload)).get('email')
+        if not email:
+            continue
+        fname = email.replace('@', '_at_') + '.json'
+        dest = os.path.join(profiles_dir, fname)
+        if not os.path.exists(dest):
+            shutil.copy2(src_path, dest)
+        elif os.path.getmtime(src_path) > os.path.getmtime(dest):
+            shutil.copy2(src_path, dest)
+    except Exception:
+        pass
+" 2>/dev/null || true
+
+    # If CLI token doesn't exist but Desktop token exists, sync Desktop token to CLI
+    if [[ ! -f "$TOKEN_FILE" && -f "$DESKTOP_TOKEN_FILE" ]]; then
+        mkdir -p "$(dirname "$TOKEN_FILE")"
+        cp "$DESKTOP_TOKEN_FILE" "$TOKEN_FILE" 2>/dev/null || true
+    fi
+
+    # Auto-initialize .current if missing
+    if [[ ! -f "$CURRENT_FILE" || ! -s "$CURRENT_FILE" ]]; then
+        local active_email=""
+        if [[ -f "$TOKEN_FILE" ]]; then
+            active_email=$(get_email "$TOKEN_FILE")
+        elif [[ -f "$DESKTOP_TOKEN_FILE" ]]; then
+            active_email=$(get_email "$DESKTOP_TOKEN_FILE")
+        fi
+        if [[ -n "$active_email" ]]; then
+            echo "$(email_to_filename "$active_email")" > "$CURRENT_FILE"
+        fi
+    fi
+}
+
+auto_sync_tokens
+
 # Match profile by exact email, file name, or partial keyword
 find_profile() {
     local query="$1"
@@ -140,13 +201,18 @@ find_profile() {
 
 cmd_save() {
     local alias_name="${1:-}"
-    if [[ ! -f "$TOKEN_FILE" ]]; then
-        echo -e "${RED}✗ Token file not found. Please log in with agy first.${NC}"
-        exit 1
+    local target_token="$TOKEN_FILE"
+    if [[ ! -f "$target_token" ]]; then
+        if [[ -f "$DESKTOP_TOKEN_FILE" ]]; then
+            target_token="$DESKTOP_TOKEN_FILE"
+        else
+            echo -e "${RED}✗ Token file not found. Please log in with agy or Antigravity Desktop first.${NC}"
+            exit 1
+        fi
     fi
 
     local email
-    email=$(get_email "$TOKEN_FILE")
+    email=$(get_email "$target_token")
 
     if [[ -z "$email" ]]; then
         echo -e "${RED}✗ Unable to parse email from token file.${NC}"
@@ -160,7 +226,7 @@ cmd_save() {
         filename=$(email_to_filename "$email")
     fi
 
-    cp "$TOKEN_FILE" "$PROFILES_DIR/$filename.json"
+    cp "$target_token" "$PROFILES_DIR/$filename.json"
     echo "$filename" > "$CURRENT_FILE"
     echo -e "${GREEN}✓ Saved account: ${CYAN}$email${NC}"
 }
@@ -170,14 +236,22 @@ cmd_switch() {
     local profile
     profile=$(find_profile "$query") || exit 1
 
+    mkdir -p "$(dirname "$TOKEN_FILE")"
     cp "$profile" "$TOKEN_FILE"
+
+    # Synchronize to Desktop token as well (treat equally)
+    if [[ -d "$HOME/.gemini" ]]; then
+        cp "$profile" "$DESKTOP_TOKEN_FILE" 2>/dev/null || true
+    fi
+
     local name
     name=$(basename "$profile" .json)
     echo "$name" > "$CURRENT_FILE"
     local email
     email=$(filename_to_email "$name")
     echo -e "${GREEN}✓ Switched to: ${CYAN}$email${NC}"
-    echo -e "${YELLOW}Note: If agy is currently running, restart it to apply the new account.${NC}"
+    echo -e "${DIM}(Synced across Antigravity CLI and Desktop)${NC}"
+    echo -e "${YELLOW}Note: If agy or Desktop is currently running, restart it to apply the new account.${NC}"
 }
 
 cmd_list() {
@@ -283,14 +357,19 @@ cmd_usage() {
         rm -rf "$work_dir"
         echo ""
     else
-        if [[ ! -f "$TOKEN_FILE" ]]; then
-            echo -e "${RED}✗ Not logged in${NC}"
-            exit 1
+        local target_token="$TOKEN_FILE"
+        if [[ ! -f "$target_token" ]]; then
+            if [[ -f "$DESKTOP_TOKEN_FILE" ]]; then
+                target_token="$DESKTOP_TOKEN_FILE"
+            else
+                echo -e "${RED}✗ Not logged in${NC}"
+                exit 1
+            fi
         fi
         local email
-        email=$(get_email "$TOKEN_FILE")
+        email=$(get_email "$target_token")
         local raw
-        raw=$(_query_usage_isolated "$TOKEN_FILE")
+        raw=$(_query_usage_isolated "$target_token")
         _render_raw_quota "$email" "" "$raw"
     fi
 }
@@ -303,26 +382,31 @@ _parallel_query_worker() {
 
 _query_usage_isolated() {
     local token_src="$1"
-    local tmp_home
-    tmp_home=$(mktemp -d)
+    python3 -c "
+import tempfile, shutil, os, subprocess, sys
 
-    mkdir -p "$tmp_home/.gemini/antigravity-cli"
-    cp "$HOME/.gemini/antigravity-cli/settings.json" "$tmp_home/.gemini/antigravity-cli/" 2>/dev/null || true
-    cp "$token_src" "$tmp_home/.gemini/antigravity-cli/antigravity-oauth-token" 2>/dev/null || true
+token_src = sys.argv[1]
+tmp_home = tempfile.mkdtemp()
+dest_dir = os.path.join(tmp_home, '.gemini/antigravity-cli')
+os.makedirs(dest_dir, exist_ok=True)
+shutil.copy2(token_src, os.path.join(dest_dir, 'antigravity-oauth-token'))
+settings_src = os.path.expanduser('~/.gemini/antigravity-cli/settings.json')
+if os.path.exists(settings_src):
+    shutil.copy2(settings_src, os.path.join(dest_dir, 'settings.json'))
 
-    local tmpout
-    tmpout=$(mktemp)
+env = os.environ.copy()
+env['HOME'] = tmp_home
 
-    HOME="$tmp_home" timeout 15 script -qec "agy -p '/usage' --print-timeout 20s" /dev/null \
-        </dev/null >"$tmpout" 2>/dev/null || true
-
-    local output
-    output=$(cat "$tmpout" 2>/dev/null)
-    rm -rf "$tmp_home" "$tmpout"
-
-    if [[ -n "$output" ]]; then
-        echo "$output" | grep -v "^Quota:" | grep -v "^Script " | grep -v "^$"
-    fi
+try:
+    res = subprocess.run(['agy', '-p', '/usage', '--print-timeout', '12s'], env=env, capture_output=True, text=True, timeout=18)
+    lines = [l for l in res.stdout.splitlines() if not l.startswith('Quota:') and not l.startswith('Script') and l.strip()]
+    if lines:
+        print('\n'.join(lines))
+except Exception:
+    pass
+finally:
+    shutil.rmtree(tmp_home, ignore_errors=True)
+" "$token_src" 2>/dev/null
 }
 
 _render_raw_quota() {
@@ -411,7 +495,7 @@ for model, periods in groups.items():
         else:
             color = R
 
-        bar = f'{color}[\"#' * filled + '-' * empty + f']{NC}'
+        bar = f'{color}[' + '#' * filled + '-' * empty + f']{NC}'
         pct_display = f'{pct:>3}%'
         parts_out.append(f'{period}: {bar} {color}{pct_display}{NC}')
 
@@ -428,10 +512,19 @@ cmd_delete() {
     name=$(basename "$profile" .json)
     local email
     email=$(filename_to_email "$name")
-    rm "$profile"
+    rm -f "$profile"
     echo -e "${GREEN}✓ Deleted profile: $email${NC}"
+
+    # Clean active tokens if matching deleted account to prevent re-sync
+    if [[ -f "$TOKEN_FILE" ]] && [[ "$(get_email "$TOKEN_FILE")" == "$email" ]]; then
+        rm -f "$TOKEN_FILE"
+    fi
+    if [[ -f "$DESKTOP_TOKEN_FILE" ]] && [[ "$(get_email "$DESKTOP_TOKEN_FILE")" == "$email" ]]; then
+        rm -f "$DESKTOP_TOKEN_FILE"
+    fi
+
     if [[ -f "$CURRENT_FILE" ]] && [[ "$(cat "$CURRENT_FILE")" == "$name" ]]; then
-        rm "$CURRENT_FILE"
+        rm -f "$CURRENT_FILE"
     fi
 }
 
@@ -516,7 +609,11 @@ cmd_add() {
             fname=$(email_to_filename "$new_email")
             cp "$TOKEN_FILE" "$PROFILES_DIR/$fname.json"
             echo "$fname" > "$CURRENT_FILE"
+            if [[ -d "$HOME/.gemini" ]]; then
+                cp "$TOKEN_FILE" "$DESKTOP_TOKEN_FILE" 2>/dev/null || true
+            fi
             echo -e "${GREEN}✓ Successfully saved new account: ${CYAN}${BOLD}$new_email${NC}"
+            echo -e "${DIM}(Synced across Antigravity CLI and Desktop)${NC}"
             [[ -n "$backup" ]] && rm -f "$backup"
             return 0
         fi
@@ -543,6 +640,8 @@ cmd_interactive() {
 
     local current=""
     [[ -f "$CURRENT_FILE" ]] && current=$(cat "$CURRENT_FILE")
+    local current_email=""
+    [[ -n "$current" ]] && current_email=$(filename_to_email "$current")
 
     echo -e "${DIM}Fetching latest quota from all accounts in parallel...${NC}"
 
@@ -617,7 +716,8 @@ except:
 
 choice_file = sys.argv[1]
 json_data = json.loads(sys.argv[2])
-emails = sys.argv[3:]
+current_email = sys.argv[3]
+emails = sys.argv[4:]
 count = len(emails)
 
 def calc_time_left(iso_str):
@@ -696,7 +796,10 @@ def render_bar(pct, width=10):
     return "#" * filled + "-" * empty
 
 def main(stdscr):
-    curses.curs_set(0)
+    try:
+        curses.curs_set(0)
+    except Exception:
+        pass
     stdscr.keypad(True)
     stdscr.nodelay(False)
 
@@ -758,7 +861,8 @@ def main(stdscr):
             email = card["email"]
             q_info = card["quota"]
 
-            num_tag = f" [{idx+1}] {email} "
+            active_tag = " (active)" if (email == current_email) else ""
+            num_tag = f" [{idx+1}] {email}{active_tag} "
             try:
                 line_top = "+--" + num_tag + "-" * max(0, card_w - len(num_tag) - 3) + "+"
                 if is_sel:
@@ -856,7 +960,7 @@ def main(stdscr):
 curses.wrapper(main)
 PYEOF
 
-    python3 "$py_script" "$choice_file" "$json_data" "${profile_emails[@]}"
+    python3 "$py_script" "$choice_file" "$json_data" "$current_email" "${profile_emails[@]}"
     rm -f "$py_script"
 
     local selected_action=""
@@ -935,11 +1039,16 @@ case "${1:-}" in
         [[ -z "${2:-}" ]] && echo -e "${RED}Please specify an account to delete${NC}" && exit 1
         cmd_delete "$2"
         ;;
+    switch)
+        shift
+        [[ -z "${1:-}" ]] && echo -e "${RED}Please specify an account to switch to${NC}" && exit 1
+        cmd_switch "$1"
+        ;;
     help|--help|-h)
         cmd_help
         ;;
     *)
-        if [[ -n "${1:-}" && -f "$PROFILES_DIR/$(email_to_filename "$1").json" ]]; then
+        if [[ -n "${1:-}" ]] && find_profile "$1" >/dev/null 2>&1; then
             cmd_switch "$1"
         else
             cmd_interactive "$@"
