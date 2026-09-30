@@ -12,7 +12,7 @@
 #   agy-switch usage [all]         Check real-time quota
 #   agy-switch delete <keyword>    Delete a saved profile
 
-set -euo pipefail
+set -eo pipefail
 
 TOKEN_FILE="$HOME/.gemini/antigravity-cli/antigravity-oauth-token"
 CLI_TOKEN_FILE="$TOKEN_FILE"
