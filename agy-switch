@@ -236,6 +236,19 @@ cmd_switch() {
     local profile
     profile=$(find_profile "$query") || exit 1
 
+    # Auto-backup existing active token if not yet saved in profiles
+    if [[ -f "$TOKEN_FILE" ]]; then
+        local active_email
+        active_email=$(get_email "$TOKEN_FILE")
+        if [[ -n "$active_email" ]]; then
+            local active_file="$PROFILES_DIR/$(email_to_filename "$active_email").json"
+            if [[ ! -f "$active_file" ]]; then
+                cp "$TOKEN_FILE" "$active_file"
+                echo -e "${GREEN}✓ Auto-saved discovered account: ${CYAN}$active_email${NC}"
+            fi
+        fi
+    fi
+
     mkdir -p "$(dirname "$TOKEN_FILE")"
     cp "$profile" "$TOKEN_FILE"
 
@@ -1051,14 +1064,12 @@ cmd_watch() {
             break
         fi
 
-        local current_email=""
-        if [[ -f "$CURRENT_FILE" ]]; then
-            current_email=$(filename_to_email "$(cat "$CURRENT_FILE")")
-        fi
+        local token_email=""
+        [[ -f "$TOKEN_FILE" ]] && token_email=$(get_email "$TOKEN_FILE")
 
-        if [[ "$current_email" != "$best_email" ]]; then
-            echo -e "${GREEN}✓ Switched to optimal account: ${CYAN}${BOLD}$best_email${NC} ${DIM}($best_reason)${NC}"
+        if [[ "$token_email" != "$best_email" ]]; then
             cmd_switch "$best_email" >/dev/null
+            echo -e "${GREEN}✓ Switched to optimal account: ${CYAN}${BOLD}$best_email${NC} ${DIM}($best_reason)${NC}"
         else
             echo -e "${GREEN}✓ Active account: ${CYAN}${BOLD}$best_email${NC} ${DIM}($best_reason)${NC}"
         fi
