@@ -626,6 +626,534 @@ cmd_add() {
     fi
 }
 
+# ── Smart Automation & Reset Kickstart ──
+
+_probe_model_isolated() {
+    local token_src="$1"
+    local model="$2"
+    local tmp_home
+    tmp_home=$(mktemp -d)
+
+    mkdir -p "$tmp_home/.gemini/antigravity-cli"
+    cp "$HOME/.gemini/antigravity-cli/settings.json" "$tmp_home/.gemini/antigravity-cli/" 2>/dev/null || true
+    cp "$token_src" "$tmp_home/.gemini/antigravity-cli/antigravity-oauth-token" 2>/dev/null || true
+
+    HOME="$tmp_home" timeout 20 script -qec "agy -p 'hi' --model '$model' --print-timeout 15s" /dev/null \
+        </dev/null >/dev/null 2>&1 || true
+
+    rm -rf "$tmp_home"
+}
+
+_pick_best_account_internal() {
+    shopt -s nullglob
+    local all_profiles=("$PROFILES_DIR"/*.json)
+    shopt -u nullglob
+
+    if [[ ${#all_profiles[@]} -eq 0 ]]; then
+        echo "NONE||No saved accounts found"
+        return
+    fi
+
+    local work_dir
+    work_dir=$(mktemp -d)
+
+    local pids=()
+    local idx=0
+    local profile_emails=()
+
+    for f in "${all_profiles[@]}"; do
+        local name
+        name=$(basename "$f" .json)
+        profile_emails+=("$(filename_to_email "$name")")
+        _parallel_query_worker "$f" "$work_dir/$idx.out" &
+        pids+=($!)
+        idx=$((idx + 1))
+    done
+
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    python3 - "$work_dir" "${#profile_emails[@]}" "${profile_emails[@]}" << 'PYEOF'
+import sys, json, os
+from datetime import datetime, timezone
+
+work_dir = sys.argv[1]
+count = int(sys.argv[2])
+emails = sys.argv[3:3+count]
+
+def parse_iso_secs(iso_str):
+    if not iso_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        return int((dt - now).total_seconds())
+    except:
+        return None
+
+def calc_time_left(secs):
+    if secs is None:
+        return ""
+    if secs <= 0:
+        return "ready"
+    days = secs // 86400
+    hrs = (secs % 86400) // 3600
+    mins = (secs % 3600) // 60
+    if days > 0:
+        return f"{days}d {hrs:02d}h"
+    elif hrs > 0:
+        return f"{hrs}h {mins:02d}m"
+    else:
+        return f"{mins}m"
+
+def parse_quota(raw):
+    lines = [l.strip() for l in raw.split("\n") if l.strip()]
+    models = {
+        "Gemini": {"5h": None, "Week": None},
+        "Claude": {"5h": None, "Week": None}
+    }
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) < 3:
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+
+        pct = None
+        period = None
+        reset_time = ""
+        full_text = " ".join(parts)
+
+        m_key = "Gemini" if "Gemini" in full_text else ("Claude" if ("Claude" in full_text or "GPT" in full_text) else None)
+        if not m_key:
+            continue
+
+        if "Weekly" in full_text or "weekly" in full_text:
+            period = "Week"
+        elif "Five" in full_text or "Hour" in full_text or "five" in full_text:
+            period = "5h"
+
+        for p in parts:
+            if p.endswith("%"):
+                try:
+                    pct = int(p.replace("%", ""))
+                except:
+                    pass
+            elif "T" in p and (p.endswith("Z") or "+" in p):
+                reset_time = p
+
+        if pct is not None and period:
+            secs = parse_iso_secs(reset_time) if reset_time else None
+            disp = calc_time_left(secs)
+            models[m_key][period] = {
+                "pct": pct,
+                "reset_raw": reset_time,
+                "reset_secs": secs,
+                "reset_display": disp
+            }
+    return models
+
+candidates = []
+for i, email in enumerate(emails):
+    outfile = os.path.join(work_dir, f"{i}.out")
+    raw = ""
+    if os.path.exists(outfile):
+        with open(outfile, "r", encoding="utf-8", errors="ignore") as f:
+            raw = f.read()
+    q = parse_quota(raw)
+
+    g_5h = (q["Gemini"].get("5h") or {}).get("pct") or 0
+    c_5h = (q["Claude"].get("5h") or {}).get("pct") or 0
+    g_wk = (q["Gemini"].get("Week") or {}).get("pct") or 0
+    c_wk = (q["Claude"].get("Week") or {}).get("pct") or 0
+
+    gemini_usable = (g_5h > 0 and g_wk > 0)
+    claude_usable = (c_5h > 0 and c_wk > 0)
+    is_usable = gemini_usable or claude_usable
+
+    resets = []
+    if gemini_usable and (q["Gemini"].get("Week") or {}).get("reset_secs") is not None:
+        resets.append(((q["Gemini"]["Week"])["reset_secs"], g_wk, "Gemini", q["Gemini"]["Week"]["reset_display"]))
+    if claude_usable and (q["Claude"].get("Week") or {}).get("reset_secs") is not None:
+        resets.append(((q["Claude"]["Week"])["reset_secs"], c_wk, "Claude", q["Claude"]["Week"]["reset_display"]))
+
+    if not is_usable:
+        item = {"email": email, "usable": False, "reason": "0% quota exhausted", "sort_key": (3, float("inf"), 0)}
+    elif resets:
+        resets.sort(key=lambda x: x[0])
+        earliest_secs, quota_pct, model_name, disp = resets[0]
+        item = {
+            "email": email,
+            "usable": True,
+            "reason": f"Weekly resets in {disp} ({model_name} {quota_pct}%)",
+            "sort_key": (1, earliest_secs, -max(g_wk, c_wk))
+        }
+    else:
+        item = {
+            "email": email,
+            "usable": True,
+            "reason": "100% untouched reserve",
+            "sort_key": (2, 0, -max(g_wk, c_wk))
+        }
+    candidates.append(item)
+
+sorted_cand = sorted(candidates, key=lambda x: x["sort_key"])
+best = sorted_cand[0] if sorted_cand and sorted_cand[0]["usable"] else None
+
+if best:
+    print(f"SUCCESS|{best['email']}|{best['reason']}")
+else:
+    print("NONE||All accounts currently exhausted")
+PYEOF
+    rm -rf "$work_dir"
+}
+
+cmd_warmup() {
+    local target="${1:-all}"
+    shopt -s nullglob
+    local all_profiles=("$PROFILES_DIR"/*.json)
+    shopt -u nullglob
+
+    if [[ ${#all_profiles[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}No accounts saved yet.${NC}"
+        return
+    fi
+
+    local is_silent=false
+    if [[ "$target" == "silent" || "$target" == "--silent" || "$target" == "-s" ]]; then
+        is_silent=true
+        target="all"
+    fi
+
+    if ! $is_silent; then
+        echo -e "${CYAN}${BOLD}=== Antigravity Quota Reset Kickstart (Warmup) ===${NC}"
+        echo -e "${DIM}Scanning accounts for untouched 100% weekly quotas without active countdowns...${NC}"
+    fi
+
+    local work_dir
+    work_dir=$(mktemp -d)
+
+    local pids=()
+    local idx=0
+    local profile_files=()
+    local profile_emails=()
+
+    for f in "${all_profiles[@]}"; do
+        local name
+        name=$(basename "$f" .json)
+        local email
+        email=$(filename_to_email "$name")
+
+        if [[ "$target" != "all" && "$target" != "-a" && "$email" != *"$target"* ]]; then
+            continue
+        fi
+
+        profile_files+=("$f")
+        profile_emails+=("$email")
+
+        _parallel_query_worker "$f" "$work_dir/$idx.out" &
+        pids+=($!)
+        idx=$((idx + 1))
+    done
+
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    local warmup_plan
+    warmup_plan=$(python3 - "$work_dir" "${#profile_emails[@]}" "${profile_emails[@]}" << 'PYEOF'
+import sys, json, os
+
+work_dir = sys.argv[1]
+count = int(sys.argv[2])
+emails = sys.argv[3:3+count]
+
+def parse_quota(raw):
+    lines = [l.strip() for l in raw.split("\n") if l.strip()]
+    models = {
+        "Gemini": {"5h": None, "Week": None},
+        "Claude": {"5h": None, "Week": None}
+    }
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) < 3:
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+
+        pct = None
+        period = None
+        reset_time = ""
+        full_text = " ".join(parts)
+
+        m_key = "Gemini" if "Gemini" in full_text else ("Claude" if ("Claude" in full_text or "GPT" in full_text) else None)
+        if not m_key:
+            continue
+
+        if "Weekly" in full_text or "weekly" in full_text:
+            period = "Week"
+        elif "Five" in full_text or "Hour" in full_text or "five" in full_text:
+            period = "5h"
+
+        for p in parts:
+            if p.endswith("%"):
+                try:
+                    pct = int(p.replace("%", ""))
+                except:
+                    pass
+            elif "T" in p and (p.endswith("Z") or "+" in p):
+                reset_time = p
+
+        if pct is not None and period:
+            models[m_key][period] = {
+                "pct": pct,
+                "reset_raw": reset_time
+            }
+    return models
+
+actions = []
+for i, email in enumerate(emails):
+    outfile = os.path.join(work_dir, f"{i}.out")
+    raw = ""
+    if os.path.exists(outfile):
+        with open(outfile, "r", encoding="utf-8", errors="ignore") as f:
+            raw = f.read()
+    q = parse_quota(raw)
+
+    gwk = q["Gemini"].get("Week")
+    if gwk and gwk.get("pct") == 100 and not gwk.get("reset_raw"):
+        actions.append(f"{i}|{email}|Gemini|gemini-3.8-flash-low")
+
+    cwk = q["Claude"].get("Week")
+    if cwk and cwk.get("pct") == 100 and not cwk.get("reset_raw"):
+        actions.append(f"{i}|{email}|Claude|claude-sonnet-4-6")
+
+for a in actions:
+    print(a)
+PYEOF
+)
+    rm -rf "$work_dir"
+
+    if [[ -z "$warmup_plan" ]]; then
+        if ! $is_silent; then
+            echo -e "${GREEN}✓ All accounts already have active reset countdowns or are currently in use!${NC}"
+            echo -e "${DIM}No accounts require warmup right now.${NC}"
+        fi
+        return 0
+    fi
+
+    local probe_pids=()
+    if ! $is_silent; then
+        echo -e "${YELLOW}Found accounts with unstarted 7-day reset countdowns:${NC}"
+    fi
+
+    while IFS='|' read -r p_idx p_email p_family p_model; do
+        [[ -z "$p_email" ]] && continue
+        local p_file="${profile_files[$p_idx]}"
+        if ! $is_silent; then
+            echo -e "  - ${CYAN}$p_email${NC} (${BOLD}$p_family${NC}): sending probe to ${DIM}$p_model${NC}..."
+        fi
+        _probe_model_isolated "$p_file" "$p_model" &
+        probe_pids+=($!)
+    done <<< "$warmup_plan"
+
+    if ! $is_silent; then
+        echo -e "${DIM}Activating reset countdowns in parallel...${NC}"
+    fi
+
+    for pid in "${probe_pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    if ! $is_silent; then
+        echo -e "${GREEN}${BOLD}✓ Warmup complete! Rolling 7-day reset timers are now ticking on all accounts.${NC}"
+    fi
+}
+
+cmd_auto() {
+    local passthrough_args=("$@")
+    shopt -s nullglob
+    local all_profiles=("$PROFILES_DIR"/*.json)
+    shopt -u nullglob
+
+    if [[ ${#all_profiles[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}No saved accounts found. Initiating login...${NC}"
+        cmd_add "${passthrough_args[@]}"
+        return
+    fi
+
+    echo -e "${DIM}Evaluating accounts concurrently (Earliest Reset First)...${NC}"
+
+    local best_info
+    best_info=$(_pick_best_account_internal)
+    local status
+    local best_email
+    local best_reason
+    status=$(echo "$best_info" | cut -d'|' -f1)
+    best_email=$(echo "$best_info" | cut -d'|' -f2)
+    best_reason=$(echo "$best_info" | cut -d'|' -f3)
+
+    if [[ "$status" != "SUCCESS" || -z "$best_email" ]]; then
+        echo -e "${RED}✗ No usable accounts found with remaining quota!${NC}"
+        echo -e "${YELLOW}Please wait for quota reset or add a new account with 'agy-switch add'.${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}🎯 Optimal account: ${CYAN}${BOLD}$best_email${NC}"
+    echo -e "   ${DIM}Priority reason: $best_reason${NC}"
+    cmd_switch "$best_email" >/dev/null
+
+    if [[ ${#passthrough_args[@]} -gt 0 ]]; then
+        echo -e "${DIM}Launching agy with args: ${passthrough_args[*]}${NC}"
+    else
+        echo -e "${DIM}Launching agy...${NC}"
+    fi
+    exec agy "${passthrough_args[@]}"
+}
+
+cmd_watch() {
+    local passthrough_args=("$@")
+
+    echo -e "${CYAN}${BOLD}=== Antigravity Multi-Account Session Supervisor ===${NC}"
+    echo -e "${DIM}Starting mega-quota supervisor. When quota is exhausted, agy will auto-swap and continue with -c.${NC}"
+    echo ""
+
+    # Silent background warmup for unstarted accounts
+    cmd_warmup silent &
+
+    local need_continue=false
+    local auto_prompt=""
+    for arg in "${passthrough_args[@]}"; do
+        if [[ "$arg" == "-c" || "$arg" == "--continue" ]]; then
+            need_continue=true
+            break
+        fi
+    done
+
+    local filtered_args=()
+    for arg in "${passthrough_args[@]}"; do
+        [[ "$arg" != "-c" && "$arg" != "--continue" ]] && filtered_args+=("$arg")
+    done
+
+    while true; do
+        local best_info
+        best_info=$(_pick_best_account_internal)
+        local status
+        local best_email
+        local best_reason
+        status=$(echo "$best_info" | cut -d'|' -f1)
+        best_email=$(echo "$best_info" | cut -d'|' -f2)
+        best_reason=$(echo "$best_info" | cut -d'|' -f3)
+
+        if [[ "$status" != "SUCCESS" || -z "$best_email" ]]; then
+            echo -e "${RED}✗ All accounts are out of quota! Supervisor stopping.${NC}"
+            break
+        fi
+
+        local current_email=""
+        if [[ -f "$CURRENT_FILE" ]]; then
+            current_email=$(filename_to_email "$(cat "$CURRENT_FILE")")
+        fi
+
+        if [[ "$current_email" != "$best_email" ]]; then
+            echo -e "${GREEN}✓ Switched to optimal account: ${CYAN}${BOLD}$best_email${NC} ${DIM}($best_reason)${NC}"
+            cmd_switch "$best_email" >/dev/null
+        else
+            echo -e "${GREEN}✓ Active account: ${CYAN}${BOLD}$best_email${NC} ${DIM}($best_reason)${NC}"
+        fi
+
+        local run_args=()
+        if $need_continue; then
+            run_args+=("-c")
+            if [[ -n "$auto_prompt" ]]; then
+                local is_print_mode=false
+                for arg in "${filtered_args[@]}"; do
+                    [[ "$arg" == "-p" || "$arg" == "--print" ]] && is_print_mode=true
+                done
+                if $is_print_mode; then
+                    run_args+=("-p" "$auto_prompt")
+                else
+                    run_args+=("-i" "$auto_prompt")
+                fi
+            fi
+        fi
+
+        for ((idx_arg=0; idx_arg<${#filtered_args[@]}; idx_arg++)); do
+            local a="${filtered_args[$idx_arg]}"
+            if $need_continue && [[ -n "$auto_prompt" ]]; then
+                if [[ "$a" == "-i" || "$a" == "--prompt-interactive" || "$a" == "-p" || "$a" == "--print" ]]; then
+                    idx_arg=$((idx_arg + 1))
+                    continue
+                fi
+            fi
+            run_args+=("$a")
+        done
+        auto_prompt=""
+
+        local log_file="$HOME/.gemini/antigravity-cli/cli.log"
+        local lines_before=0
+        [[ -f "$log_file" ]] && lines_before=$(wc -l < "$log_file" 2>/dev/null || echo 0)
+
+        echo -e "${DIM}Launching agy... (Exit with /exit or Ctrl+D to stop session)${NC}"
+        echo ""
+
+        set +e
+        agy "${run_args[@]}"
+        local agy_exit_code=$?
+        set -e
+
+        echo ""
+
+        local quota_hit=false
+        if [[ -f "$log_file" ]]; then
+            local lines_after
+            lines_after=$(wc -l < "$log_file" 2>/dev/null || echo 0)
+            if [[ $lines_after -gt $lines_before ]]; then
+                if tail -n +$((lines_before + 1)) "$log_file" 2>/dev/null | grep -qiE "(RESOURCE_EXHAUSTED|rate.*limit.*exceed|out.*of.*quota|quota.*exceed|Too Many Requests|HTTP 429)"; then
+                    quota_hit=true
+                fi
+            fi
+        fi
+
+        if ! $quota_hit; then
+            local current_profile="$PROFILES_DIR/$(email_to_filename "$best_email").json"
+            if [[ -f "$current_profile" ]]; then
+                local current_raw
+                current_raw=$(_query_usage_isolated "$current_profile")
+                if echo "$current_raw" | grep -qiE "(Limit Remaining[[:space:]]+0%|Limit Remaining[[:space:]]+1%|Limit Remaining[[:space:]]+2%)"; then
+                    quota_hit=true
+                fi
+            fi
+        fi
+
+        if $quota_hit; then
+            echo -e "${YELLOW}${BOLD}⚡ Account quota exhausted on $best_email!${NC}"
+            need_continue=true
+            auto_prompt="Continue"
+
+            echo -e "${CYAN}Auto-switching to next best account & continuing with 'Continue' in 3s...${NC}"
+            echo -e "${DIM}(Press 'q' to stop, 'n' to resume without auto-prompt, or Enter to resume immediately)${NC}"
+
+            local key=""
+            if read -t 3 -n 1 key 2>/dev/null; then
+                if [[ "$key" == "q" || "$key" == "Q" ]]; then
+                    echo -e "\n${DIM}Supervisor stopped by user.${NC}"
+                    break
+                elif [[ "$key" == "n" || "$key" == "N" ]]; then
+                    echo -e "\n${DIM}Auto-prompt skipped.${NC}"
+                    auto_prompt=""
+                fi
+            fi
+            echo ""
+            continue
+        else
+            echo -e "${DIM}Session ended normally. Exiting supervisor.${NC}"
+            break
+        fi
+    done
+}
+
 cmd_interactive() {
     local passthrough_args=("$@")
     shopt -s nullglob
@@ -778,15 +1306,66 @@ def parse_quota(raw):
         if pct is not None and period:
             models[m_key][period] = {
                 "pct": pct,
-                "reset": calc_time_left(reset_time) if reset_time else ""
+                "reset": calc_time_left(reset_time) if reset_time else "",
+                "reset_raw": reset_time,
+                "reset_secs": calc_seconds_left(reset_time) if reset_time else None
             }
     return models
+
+def calc_seconds_left(iso_str):
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        return int((dt - now).total_seconds())
+    except:
+        return None
 
 cards = []
 for i in range(count):
     e = emails[i]
     q_data = parse_quota(json_data[i])
     cards.append({"type": "account", "email": e, "quota": q_data})
+
+# Evaluate best account by Earliest Reset First
+candidates = []
+for c in cards:
+    if c["type"] != "account":
+        continue
+    q = c["quota"]
+    g_5h = (q["Gemini"].get("5h") or {}).get("pct") or 0
+    c_5h = (q["Claude"].get("5h") or {}).get("pct") or 0
+    g_wk = (q["Gemini"].get("Week") or {}).get("pct") or 0
+    c_wk = (q["Claude"].get("Week") or {}).get("pct") or 0
+
+    gemini_usable = (g_5h > 0 and g_wk > 0)
+    claude_usable = (c_5h > 0 and c_wk > 0)
+    is_usable = gemini_usable or claude_usable
+
+    resets = []
+    if gemini_usable and (q["Gemini"].get("Week") or {}).get("reset_secs") is not None:
+        resets.append(((q["Gemini"]["Week"])["reset_secs"], g_wk, "Gemini", q["Gemini"]["Week"]["reset"]))
+    if claude_usable and (q["Claude"].get("Week") or {}).get("reset_secs") is not None:
+        resets.append(((q["Claude"]["Week"])["reset_secs"], c_wk, "Claude", q["Claude"]["Week"]["reset"]))
+
+    if not is_usable:
+        sort_key = (3, float("inf"), 0)
+        reason = "0% quota"
+    elif resets:
+        resets.sort(key=lambda x: x[0])
+        earliest_secs, quota_pct, model_name, disp = resets[0]
+        sort_key = (1, earliest_secs, -max(g_wk, c_wk))
+        reason = f"Resets in {disp}"
+    else:
+        sort_key = (2, 0, -max(g_wk, c_wk))
+        reason = "Untouched reserve"
+
+    candidates.append({"card": c, "sort_key": sort_key, "reason": reason, "usable": is_usable})
+
+if candidates:
+    candidates.sort(key=lambda x: x["sort_key"])
+    if candidates[0]["usable"]:
+        candidates[0]["card"]["is_best"] = True
+        candidates[0]["card"]["best_reason"] = candidates[0]["reason"]
 
 cards.append({"type": "add", "email": "+ Add New Google Account", "quota": None})
 
@@ -821,7 +1400,7 @@ def main(stdscr):
         h, w = stdscr.getmaxyx()
 
         title = " === ANTIGRAVITY MULTI-ACCOUNT MANAGER ==="
-        tips = " [UP/DOWN] Move   [Enter] Launch   [1-9] Quick pick   [a] Add Account   [q] Quit"
+        tips = " [↑/↓] Move   [Enter] Launch   [b] Best   [w] Warmup   [1-9] Quick   [a] Add   [q] Quit"
         try:
             stdscr.addstr(1, 2, title, curses.color_pair(1) | curses.A_BOLD)
             stdscr.addstr(1, len(title) + 3, tips, curses.color_pair(6))
@@ -860,9 +1439,10 @@ def main(stdscr):
 
             email = card["email"]
             q_info = card["quota"]
+            best_mark = f" ★ BEST ({card.get('best_reason', '')})" if card.get("is_best") else ""
 
             active_tag = " (active)" if (email == current_email) else ""
-            num_tag = f" [{idx+1}] {email}{active_tag} "
+            num_tag = f" [{idx+1}] {email}{active_tag}{best_mark} "
             try:
                 line_top = "+--" + num_tag + "-" * max(0, card_w - len(num_tag) - 3) + "+"
                 if is_sel:
@@ -932,6 +1512,14 @@ def main(stdscr):
             with open(choice_file, "w") as out_f:
                 out_f.write("__ADD_NEW__")
             return
+        elif key in [ord("w"), ord("W")]:
+            with open(choice_file, "w") as out_f:
+                out_f.write("__WARMUP__")
+            return
+        elif key in [ord("b"), ord("B")]:
+            with open(choice_file, "w") as out_f:
+                out_f.write("__BEST__")
+            return
         elif key in [curses.KEY_UP, ord("k"), ord("K")]:
             selected = (selected - 1) % len(cards)
         elif key in [curses.KEY_DOWN, ord("j"), ord("J")]:
@@ -972,6 +1560,16 @@ PYEOF
     if [[ "$selected_action" == "__ADD_NEW__" ]]; then
         cmd_add "${passthrough_args[@]}"
         return
+    elif [[ "$selected_action" == "__WARMUP__" ]]; then
+        cmd_warmup
+        echo ""
+        echo -e "${DIM}Press Enter to return to menu...${NC}"
+        read -r || true
+        cmd_interactive "${passthrough_args[@]}"
+        return
+    elif [[ "$selected_action" == "__BEST__" ]]; then
+        cmd_auto "${passthrough_args[@]}"
+        return
     elif [[ -n "$selected_action" ]]; then
         echo -e "${GREEN}✓ Switching to account: ${CYAN}${BOLD}$selected_action${NC}"
         cmd_switch "$selected_action" >/dev/null
@@ -989,6 +1587,9 @@ cmd_help() {
     echo ""
     echo -e "Usage:"
     echo -e "  ${CYAN}agy-switch [agy-flags...]${NC}        Interactive TUI picker & pass-through args to agy"
+    echo -e "  ${CYAN}agy-switch auto [agy-flags...]${NC}   Auto-pick optimal account (earliest weekly reset) & launch"
+    echo -e "  ${CYAN}agy-switch watch [agy-flags...]${NC}  Mega-quota supervisor: auto-switch & resume with -c on quota hit"
+    echo -e "  ${CYAN}agy-switch warmup [email|all]${NC}   Send lightweight probe to 100% untouched accounts to start reset timers"
     echo -e "  ${CYAN}agy-switch add${NC}                   Log in and register a new Google account"
     echo -e "  ${CYAN}agy-switch export [file]${NC}         Export all account profiles to a portable archive"
     echo -e "  ${CYAN}agy-switch import <file>${NC}         Import accounts from an exported archive"
@@ -1001,6 +1602,9 @@ cmd_help() {
     echo -e "  ${CYAN}agy-switch delete <keyword>${NC}      Delete a saved account"
     echo ""
     echo -e "${YELLOW}Examples:${NC}"
+    echo -e "  agy-switch auto -c                            # Auto-pick best account & resume chat"
+    echo -e "  agy-switch watch -c                           # Run in supervisor mode (infinite quota feel)"
+    echo -e "  agy-switch warmup                             # Kickstart 7-day countdown on all unused accounts"
     echo -e "  agy-switch export my-accounts.tar.gz          # Export profiles for another machine"
     echo -e "  agy-switch import my-accounts.tar.gz          # Import on the new machine"
     echo -e "  agy-switch -c                                 # Pick account & resume previous chat"
@@ -1010,6 +1614,18 @@ cmd_help() {
 
 # ── Main Entrypoint ──
 case "${1:-}" in
+    auto|best)
+        shift
+        cmd_auto "$@"
+        ;;
+    watch|supervisor|loop)
+        shift
+        cmd_watch "$@"
+        ;;
+    warmup|probe|touch)
+        shift
+        cmd_warmup "$@"
+        ;;
     add|new)
         shift
         cmd_add "$@"

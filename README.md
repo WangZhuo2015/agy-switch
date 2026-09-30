@@ -10,10 +10,15 @@
 
 - ⚡ **Concurrent Quota Inspection**: Uses isolated temporary execution sessions to query all account quotas in parallel (~4s total).
 - 🕒 **Smart Reset Countdown**: Displays remaining time until quota refill (e.g. `(4h 40m)` or `(6d 23h)`).
-- 🖥️ **Modern Terminal TUI**: High-contrast, clean ASCII dashboard with visual quota progress bars (`[##########]`).
+- 🎯 **Earliest-Reset-First Smart Selection (`auto`)**: Automatically analyzes all saved accounts and prioritizes the one whose weekly quota resets the soonest. Maximizes overall throughput and prevents unused quota from expiring ("use it or lose it").
+- 🛡️ **Mega-Quota Session Supervisor (`watch`)**: Makes multiple accounts feel like one single, massive quota account! Automatically detects quota exhaustion (`RESOURCE_EXHAUSTED` / 429), hot-swaps to the next healthy account, resumes your conversation with `agy -c`, and automatically submits `"Continue"` via `-i` so the agent seamlessly finishes any interrupted work without typing a single word.
+- 🔥 **7-Day Rolling Reset Warmup (`warmup`)**: Antigravity quota countdowns only start upon making your first request. `warmup` sends ultra-lightweight probes to untouched 100% accounts in parallel, activating their 7-day rolling reset countdowns concurrently so all accounts refill together.
+- 🖥️ **Modern Terminal TUI**: High-contrast, clean ASCII dashboard with visual quota progress bars (`[##########]`), highlighting the recommended best account with `★ BEST`.
 - ⌨️ **Intuitive Keybindings**:
   - `↑` / `↓` or `k` / `j` to select accounts.
   - `Enter` to switch account and launch `agy`.
+  - `b` to instantly pick and launch the optimal account.
+  - `w` to run rolling reset warmup on all idle accounts.
   - `1` - `9` numerical quick-keys for instant one-touch launch.
   - `a` to log in and add a new account.
 - 🚀 **Flag Pass-Through**: Pass any flags directly to `agy` (e.g. `agy-switch -c --dangerously-skip-permissions`).
@@ -65,7 +70,23 @@ agy-switch --dangerously-skip-permissions
 agy-switch -c --dangerously-skip-permissions
 ```
 
-### 2. Fast CLI Commands
+### 2. Smart Automation & Failover (New)
+
+```bash
+# Auto-pick the best account (earliest weekly reset) and launch agy with optional flags
+agy-switch auto -c
+agy-switch auto --dangerously-skip-permissions
+
+# Launch in Mega-Quota Supervisor mode (seamless auto-failover on quota exhaustion)
+agy-switch watch
+agy-switch watch -c --dangerously-skip-permissions
+
+# Kickstart 7-day rolling reset countdown on all 100% untouched accounts
+agy-switch warmup
+agy-switch warmup myaccount@gmail.com
+```
+
+### 3. Fast CLI Commands
 
 ```bash
 # Check quota across all accounts concurrently
